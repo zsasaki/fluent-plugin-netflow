@@ -259,7 +259,7 @@ module Fluent
         key = "#{@host}|#{flowset.source_id}|#{record.flowset_id}"
         template = @templates[key]
         if ! template
-          $log.warn("No matching template for flow id #{record.flowset_id}")
+          $log.warn("No matching template for flow id #{record.flowset_id} [#{key}]")
           return
         end
 
@@ -268,7 +268,7 @@ module Fluent
         # Template shouldn't be longer than the record and there should
         # be at most 3 padding bytes
         if template.num_bytes > length or ! (length % template.num_bytes).between?(0, 3)
-          $log.warn "Template length doesn't fit cleanly into flowset",
+          $log.warn "Template length doesn't fit cleanly into flowset", key: key,
                     template_id: record.flowset_id, template_length: template.num_bytes, record_length: length
           return
         end
