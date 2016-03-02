@@ -259,7 +259,7 @@ module Fluent
         key = "#{@host}|#{flowset.source_id}|#{record.flowset_id}"
         template = @templates[key]
         if ! template
-          $log.warn("No matching template for flow id #{record.flowset_id} [#{key}]")
+          $log.warn("No matching template for flow id #{record.flowset_id} [#{key}]", key_count: @templates.length)
           return
         end
 
