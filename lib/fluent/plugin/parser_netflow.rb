@@ -54,8 +54,9 @@ module Fluent
         end
       end
 
-      def call(payload, &block)
+      def call(host, payload, &block)
         version,_ = payload[0,2].unpack('n')
+        @host = host
         case version
         when 5
           forV5(payload, block)
@@ -217,7 +218,7 @@ module Fluent
               fields += entry
             end
             # We get this far, we have a list of fields
-            key = "#{flowset.source_id}|#{template.template_id}"
+            key = "#{@host}|#{flowset.source_id}|#{template.template_id}"
             @templates[key, @cache_ttl] = BinData::Struct.new(endian: :big, fields: fields)
             # Purge any expired templates
             @templates.cleanup!
@@ -244,7 +245,7 @@ module Fluent
               fields += entry
             end
             # We get this far, we have a list of fields
-            key = "#{flowset.source_id}|#{template.template_id}"
+            key = "#{@host}|#{flowset.source_id}|#{template.template_id}"
             @templates[key, @cache_ttl] = BinData::Struct.new(endian: :big, fields: fields)
             # Purge any expired templates
             @templates.cleanup!
@@ -255,7 +256,7 @@ module Fluent
       FIELDS_FOR_COPY_V9 = ['version', 'flow_seq_num']
 
       def handle_v9_flowset_data(flowset, record, block)
-        key = "#{flowset.source_id}|#{record.flowset_id}"
+        key = "#{@host}|#{flowset.source_id}|#{record.flowset_id}"
         template = @templates[key]
         if ! template
           $log.warn("No matching template for flow id #{record.flowset_id}")
@@ -310,7 +311,7 @@ module Fluent
 
       def netflow_field_for(type, length, field_definitions)
         if field_definitions.include?(type)
-          field = field_definitions[type]
+          field = field_definitions[type].clone
           if field.is_a?(Array)
 
             if field[0].is_a?(Integer)
