@@ -26,43 +26,36 @@ module Fluent
         super
 
         @templates = Vash.new()
+        @samplers_v9 = Vash.new()
         # Path to default Netflow v9 field definitions
-        filename = File.expand_path('../netflow_option_fields.yaml', __FILE__)
+        filename = File.expand_path('../netflow_fields.yaml', __FILE__)
 
         begin
           @fields = YAML.load_file(filename)
         rescue => e
-          raise "Bad syntax in definitions file #{filename}", error_class: e.class, error: e.message
+          raise ConfigError, "Bad syntax in definitions file #{filename}, error_class = #{e.class.name}, error = #{e.message}"
         end
 
         # Allow the user to augment/override/rename the supported Netflow fields
         if @definitions
-          raise "definitions file #{@definitions} does not exists" unless File.exist?(@definitions)
+          raise ConfigError, "definitions file #{@definitions} doesn't exist" unless File.exist?(@definitions)
           begin
-            @fields.merge!(YAML.load_file(@definitions))
+            @fields['option'].merge!(YAML.load_file(@definitions))
           rescue => e
-            raise "Bad syntax in definitions file #{@definitions}", error_class: e.class, error: e.message
+            raise ConfigError, "Bad syntax in definitions file #{@definitions}, error_class = #{e.class.name}, error = #{e.message}"
           end
-        end
-        # Path to default Netflow v9 scope field definitions
-        filename = File.expand_path('../netflow_scope_fields.yaml', __FILE__)
-
-        begin
-          @scope_fields = YAML.load_file(filename)
-        rescue => e
-          raise "Bad syntax in scope definitions file #{filename}", error_class: e.class, error: e.message
         end
       end
 
-      def call(payload, &block)
+      def call(payload, host=nil, &block)
         version,_ = payload[0,2].unpack('n')
         case version
         when 5
           forV5(payload, block)
         when 9
           # TODO: implement forV9
-          flowset = Netflow9PDU.read(payload)
-          handle_v9(flowset, block)
+          pdu = Netflow9PDU.read(payload)
+          handle_v9(host, pdu, block)
         else
           $log.warn "Unsupported Netflow version v#{version}: #{version.class}"
         end
@@ -190,34 +183,33 @@ module Fluent
         end
       end
 
-      def handle_v9(flowset, block)
-        flowset.records.each do |record|
-          case record.flowset_id
+      def handle_v9(host, pdu, block)
+        pdu.records.each do |flowset|
+          case flowset.flowset_id
           when 0
-            handle_v9_flowset_template(flowset, record)
+            handle_v9_flowset_template(host, pdu, flowset)
           when 1
-            handle_v9_flowset_options_template(flowset, record)
+            handle_v9_flowset_options_template(host, pdu, flowset)
           when 256..65535
-            handle_v9_flowset_data(flowset, record, block)
+            handle_v9_flowset_data(host, pdu, flowset, block)
           else
-            $log.warn "Unsupported flowset id #{record.flowset_id}"
+            $log.warn 'Unsupported flowset', flowset_id: flowset.flowset_id
           end
         end
       end
 
-      def handle_v9_flowset_template(flowset, record)
-        record.flowset_data.templates.each do |template|
+      def handle_v9_flowset_template(host, pdu, flowset)
+        flowset.flowset_data.templates.each do |template|
           catch (:field) do
             fields = []
             template.fields.each do |field|
-              entry = netflow_field_for(field.field_type, field.field_length, @fields)
-              if !entry
-                throw :field
-              end
+              entry = netflow_field_for(field.field_type, field.field_length)
+              throw :field unless entry
+
               fields += entry
             end
             # We get this far, we have a list of fields
-            key = "#{flowset.source_id}|#{template.template_id}"
+            key = "#{host}|#{pdu.source_id}|#{template.template_id}"
             @templates[key, @cache_ttl] = BinData::Struct.new(endian: :big, fields: fields)
             # Purge any expired templates
             @templates.cleanup!
@@ -225,26 +217,24 @@ module Fluent
         end
       end
 
-      def handle_v9_flowset_options_template(flowset, record)
-        record.flowset_data.templates.each do |template|
+      NETFLOW_V9_FIELD_CATEGORIES = ['scope', 'option']
+
+      def handle_v9_flowset_options_template(host, pdu, flowset)
+        flowset.flowset_data.templates.each do |template|
           catch (:field) do
             fields = []
-            template.scope_fields.each do |field|
-              entry = netflow_field_for(field.field_type, field.field_length, @scope_fields)
-              if ! entry
-                throw :field
+
+            NETFLOW_V9_FIELD_CATEGORIES.each do |category|
+              template["#{category}_fields"].each do |field|
+                entry = netflow_field_for(field.field_type, field.field_length, category)
+                throw :field unless entry
+
+                fields += entry
               end
-              fields += entry
             end
-            template.option_fields.each do |field|
-              entry = netflow_field_for(field.field_type, field.field_length, @fields)
-              if ! entry
-                throw :field
-              end
-              fields += entry
-            end
+
             # We get this far, we have a list of fields
-            key = "#{flowset.source_id}|#{template.template_id}"
+            key = "#{host}|#{pdu.source_id}|#{template.template_id}"
             @templates[key, @cache_ttl] = BinData::Struct.new(endian: :big, fields: fields)
             # Purge any expired templates
             @templates.cleanup!
@@ -254,48 +244,56 @@ module Fluent
 
       FIELDS_FOR_COPY_V9 = ['version', 'flow_seq_num']
 
-      def handle_v9_flowset_data(flowset, record, block)
-        key = "#{flowset.source_id}|#{record.flowset_id}"
-        template = @templates[key]
+      def handle_v9_flowset_data(host, pdu, flowset, block)
+        template_key = "#{host}|#{pdu.source_id}|#{flowset.flowset_id}"
+        template = @templates[template_key]
         if ! template
-          $log.warn("No matching template for flow id #{record.flowset_id}")
+          $log.warn 'No matching template for',
+                    host: host, source_id: pdu.source_id, flowset_id: flowset.flowset_id
           return
         end
 
-        length = record.flowset_length - 4
+        length = flowset.flowset_length - 4
 
-        # Template shouldn't be longer than the record and there should
+        # Template shouldn't be longer than the flowset and there should
         # be at most 3 padding bytes
         if template.num_bytes > length or ! (length % template.num_bytes).between?(0, 3)
           $log.warn "Template length doesn't fit cleanly into flowset",
-                    template_id: record.flowset_id, template_length: template.num_bytes, record_length: length
+                    template_id: flowset.flowset_id, template_length: template.num_bytes, flowset_length: length
           return
         end
 
         array = BinData::Array.new(type: template, initial_length: length / template.num_bytes)
 
-        records = array.read(record.flowset_data)
-        records.each do |r|
-          time = flowset.unix_sec
+        fields = array.read(flowset.flowset_data)
+        fields.each do |r|
+          if is_sampler?(r)
+            sampler_key = "#{host}|#{pdu.source_id}|#{r.flow_sampler_id}"
+            register_sampler_v9 sampler_key, r
+            next
+          end
+
+          time = pdu.unix_sec  # TODO: Fluent::EventTime (see: forV5)
           event = {}
 
           # Fewer fields in the v9 header
           FIELDS_FOR_COPY_V9.each do |f|
-            event[f] = flowset[f]
+            event[f] = pdu[f]
           end
 
-          event['flowset_id'] = record.flowset_id
+          event['flowset_id'] = flowset.flowset_id
 
-          r.each_pair do |k,v|
-            case k.to_s
-            when /_switched$/
-              millis = flowset.uptime - v
-              seconds = flowset.unix_sec - (millis / 1000)
-              # v9 did away with the nanosecs field
-              micros = 1000000 - (millis % 1000)
-              event[k.to_s] = Time.at(seconds, micros).utc.strftime("%Y-%m-%dT%H:%M:%S.%3NZ")
-            else
-              event[k.to_s] = v
+          r.each_pair {|k,v| event[k.to_s] = v }
+          unless @switched_times_from_uptime
+            event['first_switched'] = format_for_switched(msec_from_boot_to_time(event['first_switched'], pdu.uptime, time, 0))
+            event['last_switched']  = format_for_switched(msec_from_boot_to_time(event['last_switched'] , pdu.uptime, time, 0))
+          end
+
+          if sampler_id = r['flow_sampler_id']
+            sampler_key = "#{host}|#{pdu.source_id}|#{sampler_id}"
+            if sampler = @samplers_v9[sampler_key]
+              event['sampling_algorithm'] ||= sampler['flow_sampler_mode']
+              event['sampling_interval'] ||= sampler['flow_sampler_random_interval']
             end
           end
 
@@ -308,33 +306,38 @@ module Fluent
         ("uint" + (((length > 0) ? length : default) * 8).to_s).to_sym
       end
 
-      def netflow_field_for(type, length, field_definitions)
-        if field_definitions.include?(type)
-          field = field_definitions[type]
-          if field.is_a?(Array)
-
-            if field[0].is_a?(Integer)
-              field[0] = uint_field(length, field[0])
-            end
-
-            # Small bit of fixup for skip or string field types where the length
-            # is dynamic
-            case field[0]
-            when :skip
-              field += [nil, {length: length}]
-            when :string
-              field += [{length: length, trim_padding: true}]
-            end
-
-            [field]
-          else
-            $log.warn "Definition should be an array", field: field
-            nil
-          end
-        else
-          $log.warn "Unsupported field", type: type, length: length
-          nil
+      def netflow_field_for(type, length, category='option')
+        unless field = @fields[category][type]
+          $log.warn "Skip unsupported field", type: type, length: length
+          return [:skip, nil, {length: length}]
         end
+
+        unless field.is_a?(Array)
+          $log.warn "Skip non-Array definition", field: field
+          return [:skip, nil, {length: length}]
+        end
+
+        # Small bit of fixup for numeric value, :skip or :string field length, which are dynamic
+        case field[0]
+        when Integer
+          [[uint_field(length, field[0]), field[1]]]
+        when :skip
+          [field + [nil, {length: length}]]
+        when :string
+          [field + [{length: length, trim_padding: true}]]
+        else
+          [field]
+        end
+      end
+
+      # covers Netflow v9 and v10 (a.k.a IPFIX)
+      def is_sampler?(record)
+        record['flow_sampler_id'] && record['flow_sampler_mode'] && record['flow_sampler_random_interval']
+      end
+
+      def register_sampler_v9(key, sampler)
+        @samplers_v9[key, @cache_ttl] = sampler
+        @samplers_v9.cleanup!
       end
     end
   end
